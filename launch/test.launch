@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Sử dụng simulation time từ rosbag -->
+    <param name="use_sim_time" value="true"/>
+
+    <!-- Node chạy LOAM -->
+    <node pkg="loam" type="loam_node" name="loam_node" output="screen"/>
+
+    <!-- Phát lại dữ liệu từ ROS bag -->
+    <arg name="bag_file" default="/home/dat/Downloads/ntu_night_08/ntu_night_08_os1_128.bag" />
+    <arg name="rate" default="0.5" />
+    
+    <node pkg="rosbag" type="play" name="rosbag_play"
+          args="--clock $(arg bag_file) --rate=$(arg rate) --loop" />
+
+    <!-- Node RViz để hiển thị dữ liệu -->
+    <node pkg="rviz" type="rviz" name="rviz" />
+</launch>
