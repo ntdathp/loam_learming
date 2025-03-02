@@ -8,7 +8,7 @@
 
     <!-- Phát lại dữ liệu từ ROS bag -->
     <arg name="bag_file" default="/home/dat/Downloads/ntu_night_08/ntu_night_08_os1_128.bag" />
-    <arg name="rate" default="0.5" />
+    <arg name="rate" default="1.0" />
     
     <node pkg="rosbag" type="play" name="rosbag_play"
           args="--clock $(arg bag_file) --rate=$(arg rate) --loop" />

@@ -10,11 +10,11 @@
 #include <deque>
 #include <vector>
 
-// Make sure your custom point type CloudXYZIT is registered in LOAM.hpp like so:
+// Ensure that your custom point type CloudXYZIT is registered in LOAM.hpp like so:
 // struct PointXYZIT {
-//     PCL_ADD_POINT4D;
+//     PCL_ADD_POINT4D;                  // Adds XYZ and padding
 //     float intensity;
-//     double t;
+//     double t;                         // Custom timestamp field
 //     EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
 // } EIGEN_ALIGN16;
 // POINT_CLOUD_REGISTER_POINT_STRUCT(PointXYZIT,
@@ -25,31 +25,28 @@
 //     (double, t, t)
 // )
 
-// A simple ROS node wrapping LOAM with data stream buffering, processing,
-// and publishing odometry. It uses the timestamp provided by the rosbag messages.
+// ROS node for LOAM processing using a queue-based approach with relative time handling.
 class LOAMNode
 {
 public:
     LOAMNode(ros::NodeHandle &nh)
     {
-        // Create a shared NodeHandle pointer.
         nh_ptr = boost::make_shared<ros::NodeHandle>(nh);
         
-        // Read parameters for buffering and downsampling.
-        nh_ptr->param("buffer_duration", buffer_duration, 1.0); // seconds.
-        nh_ptr->param("cloud_ds", cloud_downsample_radius, 0.1);  // meters.
+        // Read downsampling parameter from the parameter server.
+        nh_ptr->param("cloud_ds", cloud_downsample_radius, 0.1);  // Downsampling radius in meters
         
-        // Initialize the point cloud buffer.
-        cloud_buffer.reset(new CloudXYZIT);
-        // Khởi tạo buffer_start_time với giá trị không hợp lệ.
-        buffer_start_time = -1.0;
+        // Initialize the cloud queue.
+        // Each incoming cloud is converted to CloudXYZIT and pushed into this queue.
+        // They will be processed asynchronously via a ROS timer.
+        initial_time = -1.0;
         
-        // Pose initialization using mytf (from utility.h).
+        // Pose initialization using mytf (from utility.h)
         mytf T_init_tf;
-        double t0 = ros::Time::now().toSec();
+        // t0 will be set when the first cloud is received.
+        double t0 = 0.0;
         int lidarIndex = 0;
         
-        // Create the LOAM object (constructor expects lvalue parameters).
         loam_ptr = std::make_shared<LOAM>(
             nh_ptr,
             nh_mutex,
@@ -58,85 +55,119 @@ public:
             lidarIndex
         );
         
-        // Subscribe to the rosbag topic "/os_cloud_node/points".
-        sub_ = nh_ptr->subscribe("/os_cloud_node/points", 1, 
-                                 &LOAMNode::cloudCallback,
-                                 this);
+        // Subscribe to the LiDAR point cloud topic.
+        sub_ = nh_ptr->subscribe("/os_cloud_node/points", 1,
+                                 &LOAMNode::cloudCallback, this);
         ROS_INFO("LOAMNode: subscribed to /os_cloud_node/points");
         
-        // Advertise topics to publish Associate, Visualize, and Odometry results.
+        // Advertise output topics.
         associate_pub = nh_ptr->advertise<sensor_msgs::PointCloud2>("/loam_associate", 1);
         visualize_pub = nh_ptr->advertise<sensor_msgs::PointCloud2>("/loam_visualize", 1);
         odom_pub = nh_ptr->advertise<nav_msgs::Odometry>("/loam_odom", 1);
+        
+        // Create a timer to process queued clouds every 0.2 seconds.
+        processing_timer = nh_ptr->createTimer(ros::Duration(0.2),
+                                                &LOAMNode::processBuffer, this);
     }
-
-    // Callback for incoming point clouds.
+    
+    // Callback for receiving point cloud messages.
+    // Converts each incoming message to CloudXYZIT and pushes it into the queue.
     void cloudCallback(const sensor_msgs::PointCloud2ConstPtr &cloud_msg)
     {
         double msg_time = cloud_msg->header.stamp.toSec();
-        ROS_INFO("Entered cloudCallback at time: %.3f", msg_time);
+        // ROS_INFO("Entered cloudCallback at time: %.3f", msg_time);
         
-        // Nếu buffer_start_time chưa được khởi tạo, gán bằng thời gian của thông điệp đầu tiên.
-        if (buffer_start_time < 0)
-        {
-            buffer_start_time = msg_time;
-            ROS_INFO("Initialized buffer_start_time: %.3f", buffer_start_time);
+        // If this is the first message, initialize initial_time and update trajectory start time.
+        if (initial_time < 0) {
+            initial_time = msg_time;
+            // ROS_INFO("Initialized initial_time: %.3f", initial_time);
+            loam_ptr->GetTraj()->setStartTime(0.0);
+            // Removed direct reference to loam_ptr->T_W_Li0 because it is private.
         }
         
-        // Convert the incoming message to a temporary pcl::PointCloud<PointXYZI>.
+        // Convert ROS PointCloud2 message to pcl::PointCloud<PointXYZI>
         pcl::PointCloud<PointXYZI> tempCloud;
         pcl::fromROSMsg(*cloud_msg, tempCloud);
-        ROS_INFO("Converted cloud has %zu points", tempCloud.size());
+        // ROS_INFO("Converted cloud has %zu points", tempCloud.size());
         
-        // Create a CloudXYZIT and copy over x, y, z, intensity,
-        // assigning the 't' field from the message header stamp.
+        // Convert to CloudXYZIT and assign the 't' field from the message header.
+        // We store time as relative to initial_time.
         CloudXYZITPtr rawCloud(new CloudXYZIT);
         rawCloud->resize(tempCloud.size());
+        double rel_time = msg_time - initial_time;
         for (size_t i = 0; i < tempCloud.size(); ++i) {
             rawCloud->points[i].x = tempCloud.points[i].x;
             rawCloud->points[i].y = tempCloud.points[i].y;
             rawCloud->points[i].z = tempCloud.points[i].z;
             rawCloud->points[i].intensity = tempCloud.points[i].intensity;
-            rawCloud->points[i].t = msg_time;
+            rawCloud->points[i].t = rel_time;
         }
         
-        // Accumulate the incoming cloud into the buffer.
-        *cloud_buffer += *rawCloud;
+        // Push the cloud into the queue (thread-safe).
+        {
+            std::lock_guard<std::mutex> lock(buffer_mutex);
+            cloud_queue.push_back(rawCloud);
+            // ROS_INFO("Pushed cloud to queue, queue size: %zu", cloud_queue.size());
+        }
+    }
+    
+    // Timer callback to process clouds from the queue one by one.
+    void processBuffer(const ros::TimerEvent &)
+    {
+        CloudXYZITPtr cloudToProcess;
+        {
+            std::lock_guard<std::mutex> lock(buffer_mutex);
+            if (cloud_queue.empty())
+                return;
+            // Retrieve the first cloud from the queue.
+            cloudToProcess = cloud_queue.front();
+            cloud_queue.pop_front();
+        }
+        double processTime = (cloudToProcess->empty()) ? 0.0 : cloudToProcess->points[0].t;
+        // ROS_INFO("Processing cloud from queue, relative time: %.3f, size: %zu", processTime, cloudToProcess->size());
         
-        double dt = msg_time - buffer_start_time;
-        ROS_INFO("Time difference dt: %.3f (buffer_duration: %.3f)", dt, buffer_duration);
-        
-        // Nếu dt chưa vượt quá buffer_duration, chờ thêm dữ liệu.
-        if (dt < buffer_duration)
-            return;
-        
-        ROS_INFO("Processing buffered cloud with %zu points", cloud_buffer->size());
-        
-        // Downsample the accumulated cloud using uniform sampling.
+        // Downsample the cloud using UniformSampling.
+        // Use the overload that outputs a temporary point cloud to preserve all fields.
         CloudXYZITPtr downsampledCloud(new CloudXYZIT);
+        // ROS_INFO("Downsampling cloud of size: %zu", cloudToProcess->size());
         {
             pcl::UniformSampling<PointXYZIT> downsampler;
             downsampler.setRadiusSearch(cloud_downsample_radius);
-            downsampler.setInputCloud(cloud_buffer);
-            downsampler.filter(*downsampledCloud);
+            downsampler.setInputCloud(cloudToProcess);
+            pcl::PointCloud<PointXYZIT> tempFiltered;
+            downsampler.filter(tempFiltered);
+            *downsampledCloud = tempFiltered;
+        }
+        // ROS_INFO("Downsampled cloud has %zu points", downsampledCloud->size());
+        if (downsampledCloud->empty()) {
+            ROS_WARN("Downsampled cloud is empty, skipping processing.");
+            return;
+        }
+        // ROS_INFO("First point timestamp in downsampled cloud (relative): %.3f", downsampledCloud->points[0].t);
+        
+        // Ensure the trajectory is extended to cover processTime.
+        while (loam_ptr->GetTraj()->getMaxTime() < processTime) {
+            loam_ptr->GetTraj()->extendOneKnot(loam_ptr->GetTraj()->getKnot(loam_ptr->GetTraj()->getNumKnots()-1));
+            // ROS_INFO("Extended trajectory to cover time: %.3f", loam_ptr->GetTraj()->getMaxTime());
         }
         
-        // Create an output cloud for deskewed data (converted to PointXYZI type).
+        // Deskew the cloud.
         CloudXYZIPtr deskewedCloud(new CloudXYZI);
+        // ROS_INFO("Starting deskew processing.");
         loam_ptr->Deskew(loam_ptr->GetTraj(), downsampledCloud, deskewedCloud);
-        ROS_INFO("Buffered cloud deskewed: %zu points", deskewedCloud->size());
+        // ROS_INFO("Deskewed cloud has %zu points", deskewedCloud->size());
         
-        // --- Associate and Visualize Processing ---
+        // Feature Association.
         KdFLANNPtr kdtreeMap = boost::make_shared<pcl::KdTreeFLANN<PointXYZI>>();
-        CloudXYZIPtr priormap(new CloudXYZI); // Empty priormap (placeholder).
-        CloudXYZIPtr cloudInB(new CloudXYZI);   // Placeholder for transformed cloud.
-        CloudXYZIPtr cloudInW(new CloudXYZI);   // Placeholder for world-transformed cloud.
+        CloudXYZIPtr priormap(new CloudXYZI); // Placeholder for prior map.
+        CloudXYZIPtr cloudInW(new CloudXYZI);
         std::vector<LidarCoef> Coef;
-        
+        // ROS_INFO("Starting Associate processing.");
         loam_ptr->Associate(loam_ptr->GetTraj(), kdtreeMap, priormap, downsampledCloud, deskewedCloud, cloudInW, Coef);
         ROS_INFO("Associated features: %zu", Coef.size());
         
-        CloudXYZIPtr associatedCloud(new CloudXYZI());
+        // Convert associated features into a point cloud for visualization.
+        CloudXYZIPtr associatedCloud(new CloudXYZI);
         for (const auto &coef : Coef)
         {
             PointXYZI p;
@@ -149,7 +180,8 @@ public:
         
         sensor_msgs::PointCloud2 associateMsg;
         pcl::toROSMsg(*associatedCloud, associateMsg);
-        associateMsg.header.stamp = cloud_msg->header.stamp;
+        // Convert relative processTime back to absolute time by adding initial_time.
+        associateMsg.header.stamp = ros::Time(processTime + initial_time);
         associateMsg.header.frame_id = "world";
         associate_pub.publish(associateMsg);
         
@@ -157,20 +189,21 @@ public:
         swCloudCoef.push_back(Coef);
         
         sensor_msgs::PointCloud2 visualizedMsg;
-        loam_ptr->Visualize(buffer_start_time, msg_time, swCloudCoef, associatedCloud, true);
+        loam_ptr->Visualize(processTime, processTime, swCloudCoef, associatedCloud, true);
         visualize_pub.publish(visualizedMsg);
         ROS_INFO("Published visualization result");
         
-        // --- Odometry Publication ---
-        SE3d currentPose = loam_ptr->GetTraj()->pose(msg_time);
+        // Compute and publish odometry.
+        SE3d currentPose = loam_ptr->GetTraj()->pose(processTime);
         ROS_INFO("Computed current pose:");
-        ROS_INFO("  Position: [%.3f, %.3f, %.3f]", currentPose.translation().x(), currentPose.translation().y(), currentPose.translation().z());
-        ROS_INFO("  Orientation (quat): [%.3f, %.3f, %.3f, %.3f]", 
-                 currentPose.unit_quaternion().x(), currentPose.unit_quaternion().y(), 
+        ROS_INFO("  Position: [%.3f, %.3f, %.3f]",
+                 currentPose.translation().x(), currentPose.translation().y(), currentPose.translation().z());
+        ROS_INFO("  Orientation (quat): [%.3f, %.3f, %.3f, %.3f]",
+                 currentPose.unit_quaternion().x(), currentPose.unit_quaternion().y(),
                  currentPose.unit_quaternion().z(), currentPose.unit_quaternion().w());
         
         nav_msgs::Odometry odomMsg;
-        odomMsg.header.stamp = cloud_msg->header.stamp;
+        odomMsg.header.stamp = ros::Time(processTime + initial_time);
         odomMsg.header.frame_id = "world";
         odomMsg.child_frame_id = "lidar_0_body";
         odomMsg.pose.pose.position.x = currentPose.translation().x();
@@ -182,12 +215,8 @@ public:
         odomMsg.pose.pose.orientation.w = currentPose.unit_quaternion().w();
         odom_pub.publish(odomMsg);
         ROS_INFO("Published odometry message");
-        
-        // Clear the buffer and reset buffer_start_time to current message time.
-        cloud_buffer->clear();
-        buffer_start_time = msg_time;
     }
-
+    
 private:
     boost::shared_ptr<ros::NodeHandle> nh_ptr;
     std::mutex nh_mutex;
@@ -197,10 +226,15 @@ private:
     ros::Publisher visualize_pub;
     ros::Publisher odom_pub;
     
-    CloudXYZITPtr cloud_buffer;
-    double buffer_start_time;
-    double buffer_duration;
+    // Queue for storing incoming point clouds.
+    std::deque<CloudXYZITPtr> cloud_queue;
+    std::mutex buffer_mutex;
+    
     double cloud_downsample_radius;
+    ros::Timer processing_timer;
+    
+    // initial_time is the absolute time (from the first message) used to compute relative time.
+    double initial_time;
 };
 
 int main(int argc, char** argv)
