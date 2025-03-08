@@ -1,42 +1,30 @@
-#include "LOAM.hpp"
 #include <ros/ros.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <nav_msgs/Odometry.h>
-#include <pcl_conversions/pcl_conversions.h>
-#include <pcl/common/common.h>
-#include <pcl/filters/uniform_sampling.h>
 #include <mutex>
 #include <memory>
 #include <deque>
 #include <vector>
 
-// Ensure that your custom point type CloudXYZIT is registered in LOAM.hpp like so:
-// struct PointXYZIT {
-//     PCL_ADD_POINT4D;                  // Adds XYZ and padding
-//     float intensity;
-//     double t;                         // Custom timestamp field
-//     EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
-// } EIGEN_ALIGN16;
-// POINT_CLOUD_REGISTER_POINT_STRUCT(PointXYZIT,
-//     (float, x, x)
-//     (float, y, y)
-//     (float, z, z)
-//     (float, intensity, intensity)
-//     (double, t, t)
-// )
+// ROS messages
+#include <sensor_msgs/PointCloud2.h>
+#include <nav_msgs/Odometry.h>
 
+// PCL
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/common/common.h>
+#include <pcl/filters/uniform_sampling.h>
 
+// Custom headers
+#include "LOAM.hpp"
 
 /**
- * @brief Load prior map từ file PCD nếu được bật, downsample nếu `pmap_leaf_size` hợp lệ, và khởi tạo KdTree.
- * @param use_priormap Nếu `false`, không load prior map.
- * @param priormap_file Đường dẫn tới file prior map (.pcd)
- * @param pmap_leaf_size Kích thước voxel để downsample prior map (nếu tồn tại)
- * @param priormap Biến lưu trữ prior map (PointCloud)
- * @param kdTreeMap KdTree để truy vấn điểm trong prior map
- * @return true nếu load thành công hoặc nếu `use_priormap = false`, false nếu có lỗi khi tải prior map.
+ * @brief Load the prior map from a PCD file if enabled, downsample if `pmap_leaf_size` is valid, and initialize KdTree.
+ * @param use_priormap If `false`, do not load the prior map.
+ * @param priormap_file Path to the prior map file (.pcd)
+ * @param pmap_leaf_size Voxel size for downsampling the prior map (if applicable)
+ * @param priormap Variable to store the prior map (PointCloud)
+ * @param kdTreeMap KdTree for querying points in the prior map
+ * @return true if successfully loaded or if `use_priormap = false`, false if there is an error loading the prior map.
  */
-
 bool loadPriorMap(bool use_priormap, const std::string &priormap_file, double pmap_leaf_size,
                   CloudXYZIPtr &priormap, KdFLANNPtr &kdTreeMap)
 {
@@ -52,7 +40,7 @@ bool loadPriorMap(bool use_priormap, const std::string &priormap_file, double pm
         return false;
     }
 
-    // Load dữ liệu từ file PCD vào point cloud
+    // Load data from the PCD file into the point cloud
     priormap.reset(new pcl::PointCloud<pcl::PointXYZI>());
     if (pcl::io::loadPCDFile<pcl::PointXYZI>(priormap_file, *priormap) == -1)
     {
@@ -62,7 +50,7 @@ bool loadPriorMap(bool use_priormap, const std::string &priormap_file, double pm
 
     ROS_INFO("Loaded prior map with %zu points", priormap->size());
 
-    // Giảm mật độ dữ liệu nếu cần
+    // Reduce data density if needed
     if (pmap_leaf_size > 0)
     {
         pcl::UniformSampling<pcl::PointXYZI> downsampler;
@@ -81,7 +69,7 @@ bool loadPriorMap(bool use_priormap, const std::string &priormap_file, double pm
         ROS_WARN("Skipping downsampling because pmap_leaf_size is not set.");
     }
 
-    // Xây dựng KdTree để hỗ trợ truy vấn nhanh
+    // Build KdTree for fast point queries
     kdTreeMap.reset(new pcl::KdTreeFLANN<pcl::PointXYZI>());
     kdTreeMap->setInputCloud(priormap);
 
@@ -93,10 +81,10 @@ bool loadPriorMap(bool use_priormap, const std::string &priormap_file, double pm
 void publishPose(ros::Publisher &odom_pub, const std::shared_ptr<LOAM> &loam_ptr, 
                  double processTime, double initial_time)
 {
-    // Tính toán pose hiện tại từ trajectory
+    // Compute the current pose from the trajectory
     SE3d currentPose = loam_ptr->GetTraj()->pose(processTime);
 
-    // In thông tin pose ra log
+    // Log the computed pose
     ROS_INFO("Computed current pose:");
     ROS_INFO("  Position: [%.3f, %.3f, %.3f]",
              currentPose.translation().x(), 
@@ -108,9 +96,9 @@ void publishPose(ros::Publisher &odom_pub, const std::shared_ptr<LOAM> &loam_ptr
              currentPose.unit_quaternion().z(), 
              currentPose.unit_quaternion().w());
 
-    // Tạo và thiết lập thông điệp odometry
+    // Create and set up the odometry message
     nav_msgs::Odometry odomMsg;
-    odomMsg.header.stamp = ros::Time(processTime + initial_time);  // Sử dụng absolute timestamp
+    odomMsg.header.stamp = ros::Time(processTime + initial_time);  // Use absolute timestamp
     odomMsg.header.frame_id = "world";
     odomMsg.child_frame_id = "lidar_0_body";
 
@@ -127,9 +115,6 @@ void publishPose(ros::Publisher &odom_pub, const std::shared_ptr<LOAM> &loam_ptr
     odom_pub.publish(odomMsg);
 }
 
-
-
-
 // ROS node for LOAM processing using a queue-based approach with relative time handling.
 class LOAMNode
 {
@@ -144,7 +129,7 @@ void init(ros::NodeHandle &nh)
 {
 ROS_INFO("Initializing LOAMNode...");
 
-        // (1) Đọc tham số từ ROS Parameter Server
+        // (1) Read parameters from the ROS Parameter Server
         bool use_priormap;
         std::string priormap_file;
         double pmap_leaf_size = 0.0;
@@ -156,17 +141,16 @@ ROS_INFO("Initializing LOAMNode...");
         double init_x, init_y, init_z, init_qx, init_qy, init_qz, init_qw;
         ss >> init_x >> init_y >> init_z >> init_qx >> init_qy >> init_qz >> init_qw;
 
-        nh.param("use_priormap", use_priormap, false);  // Mặc định bật prior map
+        nh.param("use_priormap", use_priormap, true);  // Default to enabling prior map
         nh.getParam("priormap_file", priormap_file);
         nh.getParam("pmap_leaf_size", pmap_leaf_size);
-        nh.param("cloud_ds", cloud_downsample_radius, 0.1);  // Downsampling mặc định 0.1m
+        nh.param("cloud_ds", cloud_downsample_radius, 0.1);  // Default downsampling to 0.1m
 
-        // (2) Load prior map nếu được bật
+        priormap.reset(new pcl::PointCloud<pcl::PointXYZI>());
+        kdTreeMap.reset(new pcl::KdTreeFLANN<pcl::PointXYZI>());
+        // (2) Load prior map if enabled
         if (use_priormap && !priormap_file.empty())
         {
-            priormap.reset(new pcl::PointCloud<pcl::PointXYZI>());
-            kdTreeMap.reset(new pcl::KdTreeFLANN<pcl::PointXYZI>());
-
             if (pcl::io::loadPCDFile<pcl::PointXYZI>(priormap_file, *priormap) == -1)
             {
                 ROS_ERROR("Could not load prior map from %s", priormap_file.c_str());
@@ -175,7 +159,7 @@ ROS_INFO("Initializing LOAMNode...");
             {
                 ROS_INFO("Loaded prior map with %zu points", priormap->size());
 
-                // Giảm mật độ dữ liệu nếu cần
+                // Reduce point cloud density if needed
                 if (pmap_leaf_size > 0)
                 {
                     pcl::UniformSampling<pcl::PointXYZI> downsampler;
@@ -190,7 +174,7 @@ ROS_INFO("Initializing LOAMNode...");
                              priormap->size(), pmap_leaf_size);
                 }
 
-                // Xây dựng KdTree
+                // Build KdTree
                 kdTreeMap->setInputCloud(priormap);
                 ROS_INFO("Built KdTree for prior map.");
             }
@@ -200,7 +184,7 @@ ROS_INFO("Initializing LOAMNode...");
             ROS_WARN("Prior map is disabled or file not provided.");
         }
 
-        // (3) Khởi tạo biến hệ thống
+        // (3) Initialize system variables
         initial_time = -1.0;
         double t0 = 0.0;
         int lidarIndex = 0;
@@ -217,17 +201,16 @@ ROS_INFO("Initializing LOAMNode...");
             lidarIndex
         );
 
-
         ROS_INFO("LOAM system initialized.");
 
-        // (4) Thiết lập Subscriber (Nhận dữ liệu từ LiDAR)
+        // (4) Set up Subscriber (Receive data from LiDAR)
         sub_ = nh_ptr->subscribe("/os_cloud_node/points", 1, &LOAMNode::cloudCallback, this);
         ROS_INFO("Subscribed to /os_cloud_node/points");
 
-        // (5) Thiết lập các Publisher
+        // (5) Set up Publishers
         odom_pub = nh_ptr->advertise<nav_msgs::Odometry>("/loam_odom", 1);
 
-        // (6) Tạo timer xử lý buffer
+        // (6) Create buffer processing timer
         processing_timer = nh_ptr->createTimer(ros::Duration(0.2), &LOAMNode::processBuffer, this);
 
         ROS_INFO("LOAMNode initialization completed.");
@@ -245,7 +228,6 @@ void cloudCallback(const sensor_msgs::PointCloud2ConstPtr &cloud_msg)
             initial_time = msg_time;
             // ROS_INFO("Initialized initial_time: %.3f", initial_time);
             loam_ptr->GetTraj()->setStartTime(0.0);
-            // Removed direct reference to loam_ptr->T_W_Li0 because it is private.
         }
         
         // Convert ROS PointCloud2 message to pcl::PointCloud<PointXYZI>
@@ -320,26 +302,61 @@ void cloudCallback(const sensor_msgs::PointCloud2ConstPtr &cloud_msg)
         loam_ptr->Deskew(loam_ptr->GetTraj(), downsampledCloud, deskewedCloud);
         ROS_INFO("Deskewed cloud has %zu points", deskewedCloud->size());
         
-        // Transform deskewed cloud into world coordinates.
+        // Transform the deskewed cloud into world coordinates.
         CloudXYZIPtr cloudInW(new CloudXYZI);
         {
-            // Lấy thời gian của điểm cuối cùng trong đám mây đã deskew.
+            // Get the timestamp of the last point in the deskewed cloud.
             double t_last = downsampledCloud->points.back().t;
-            // Lấy pose tại thời điểm t_last từ trajectory.
+            // Retrieve the pose at t_last from the trajectory.
             SE3d pose = loam_ptr->GetTraj()->pose(t_last);
-            // Chuyển đổi đám mây sang hệ tọa độ thế giới.
+            // Transform the cloud into the world coordinate frame.
             pcl::transformPointCloud(*deskewedCloud, *cloudInW, pose.translation(), pose.so3().unit_quaternion());
         }
-        
+        ROS_INFO("Successfully transformed deskewed cloud into world coordinates.");
+
         std::vector<LidarCoef> Coef;
-        // ROS_INFO("Starting Associate processing.");
+        ROS_INFO("Starting Associate processing.");
+        if (!priormap ) {
+            ROS_ERROR("One or more input pointers are nullptr!");
+            return;
+        }
         loam_ptr->Associate(loam_ptr->GetTraj(), kdTreeMap, priormap, downsampledCloud, deskewedCloud, cloudInW, Coef);
         ROS_INFO("Associated features: %zu", Coef.size());
 
+        // Initialize pose variables for optimization (initially using the current trajectory pose)
+        Eigen::Quaterniond current_q = loam_ptr->GetTraj()->pose(processTime).unit_quaternion();
+        Eigen::Vector3d current_t = loam_ptr->GetTraj()->pose(processTime).translation();
 
+        // Store pose parameters into an array [qw, qx, qy, qz, tx, ty, tz]
+        double pose_update[7] = { current_q.w(), current_q.x(), current_q.y(), current_q.z(),
+                                  current_t.x(), current_t.y(), current_t.z() };
 
+        ceres::Problem problem;
 
-        
+        // Add residual blocks for each feature in Coef
+        for (const auto &coef : Coef) {
+            // Create a cost function for each residual block using AutoDiff 
+            // (Residual size = 3, pose has 7 parameters)
+            ceres::CostFunction* cost_function =
+                new ceres::AutoDiffCostFunction<LoamResidual, 3, 7>(new LoamResidual(coef));
+            problem.AddResidualBlock(cost_function, nullptr, pose_update);
+        }
+
+        // Configure solver options
+        ceres::Solver::Options options;
+        options.linear_solver_type = ceres::DENSE_QR;
+        options.minimizer_progress_to_stdout = true;
+        ceres::Solver::Summary summary;
+
+        // Solve the optimization problem
+        ceres::Solve(options, &problem, &summary);
+        ROS_INFO("Ceres optimization complete: %s", summary.BriefReport().c_str());
+
+        // After optimization, update the pose in the LOAM system.
+        // Example: Update trajectory with the optimized pose
+        Eigen::Quaterniond optimized_q(pose_update[0], pose_update[1], pose_update[2], pose_update[3]);
+        Eigen::Vector3d optimized_t(pose_update[4], pose_update[5], pose_update[6]);
+        loam_ptr->UpdatePose(optimized_q, optimized_t);
 
         publishPose(odom_pub, loam_ptr, processTime, initial_time);
 
@@ -362,9 +379,8 @@ private:
     // initial_time is the absolute time (from the first message) used to compute relative time.
     double initial_time;
 
-    CloudXYZIPtr priormap;  // Prior map lưu dưới dạng point cloud
-    KdFLANNPtr kdTreeMap;   // KdTree để truy vấn nhanh
-
+    CloudXYZIPtr priormap;  // Prior map stored as a point cloud
+    KdFLANNPtr kdTreeMap;   // KdTree for fast point queries
 
 };
 

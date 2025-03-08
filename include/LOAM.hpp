@@ -15,6 +15,7 @@
 /* All needed for filter of custom point type----------*/
 
 // All about gaussian process
+#include "factor/loam_resudual.hpp"
 #include "GaussianProcess.hpp"
 
 // // Custom solver
@@ -247,5 +248,25 @@ public:
     GaussianProcessPtr &GetTraj()
     {
         return traj;
+    }
+
+    void UpdatePose(const Eigen::Quaterniond &optimized_q, const Eigen::Vector3d &optimized_t)
+    {
+        // Get the index of the last knot in the trajectory.
+        int knot_idx = traj->getNumKnots() - 1;
+        
+        // Retrieve the corresponding time for the current knot.
+        double t = traj->getKnotTime(knot_idx);  // Alternatively: t = t0 + knot_idx * dt
+        
+        // Create an SE3d object from the optimized quaternion and translation vector.
+        Sophus::SE3d optimized_pose(optimized_q, optimized_t);
+        
+        // Create a new GPState with time t and the optimized pose.
+        GPState<double> new_state(t, optimized_pose);
+        
+        // Update the last knot of the trajectory.
+        traj->setKnot(knot_idx, new_state);
+        
+        ROS_INFO("Updated trajectory at knot %d with new pose.", knot_idx);
     }
 };

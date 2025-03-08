@@ -3,8 +3,17 @@
     <!-- Sử dụng simulation time từ rosbag -->
     <param name="use_sim_time" value="true"/>
 
+    <!-- Thêm tham số priormap_file -->
+    <arg name="priormap_file" default="/home/dat/Downloads/PriorMaps/ntu_prior/GlobalSurfMap.pcd" />
+
+    <!-- Thêm tham số init_pose -->
+    <arg name="init_pose" default="195.7344711 -8.565884313 7.179058749 0.3859110916 0.9225347074 -0.001525438333 -0.0001268114547" />
+
     <!-- Node chạy LOAM -->
-    <node pkg="loam" type="loam_node" name="loam_node" output="screen"/>
+    <node pkg="loam" type="loam_node" name="loam_node" output="screen">
+        <param name="priormap_file" value="$(arg priormap_file)" />
+        <param name="init_pose" value="$(arg init_pose)" />
+    </node>
 
     <!-- Phát lại dữ liệu từ ROS bag -->
     <arg name="bag_file" default="/home/dat/Downloads/ntu_night_08/ntu_night_08_os1_128.bag" />
@@ -13,6 +22,6 @@
     <node pkg="rosbag" type="play" name="rosbag_play"
           args="--clock $(arg bag_file) --rate=$(arg rate) --loop" />
 
-    <!-- Node RViz để hiển thị dữ liệu -->
-    <node pkg="rviz" type="rviz" name="rviz" />
+    <!-- Node RViz để hiển thị dữ liệu với file config -->
+    <node pkg="rviz" type="rviz" name="rviz" args="-d $(find loam)/config/test.rviz" />
 </launch>
