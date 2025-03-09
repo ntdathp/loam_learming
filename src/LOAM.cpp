@@ -74,7 +74,6 @@ bool loadPriorMap(bool use_priormap, const std::string &priormap_file, double pm
     kdTreeMap->setInputCloud(priormap);
 
     ROS_INFO("Built KdTree for prior map.");
-
     return true;
 }
 
@@ -208,7 +207,12 @@ ROS_INFO("Initializing LOAMNode...");
         ROS_INFO("Subscribed to /os_cloud_node/points");
 
         // (5) Set up Publishers
-        odom_pub = nh_ptr->advertise<nav_msgs::Odometry>("/loam_odom", 1);
+        odom_pub = nh_ptr->advertise<nav_msgs::Odometry>("/loam_odom", 10);
+        cloudinW_pub = nh_ptr->advertise<sensor_msgs::PointCloud2>("/cloudinW", 10);
+        priormap_pub = nh_ptr->advertise<sensor_msgs::PointCloud2>("/priormap", 1);
+
+        // Publish priormap
+        Util::publishCloud(priormap_pub, *priormap, ros::Time::now(), "world");
 
         // (6) Create buffer processing timer
         processing_timer = nh_ptr->createTimer(ros::Duration(0.2), &LOAMNode::processBuffer, this);
@@ -358,6 +362,8 @@ void cloudCallback(const sensor_msgs::PointCloud2ConstPtr &cloud_msg)
         Eigen::Vector3d optimized_t(pose_update[4], pose_update[5], pose_update[6]);
         loam_ptr->UpdatePose(optimized_q, optimized_t);
 
+        Util::publishCloud(cloudinW_pub, *cloudInW, ros::Time::now(), "world");
+
         publishPose(odom_pub, loam_ptr, processTime, initial_time);
 
     }
@@ -366,9 +372,12 @@ private:
     boost::shared_ptr<ros::NodeHandle> nh_ptr;
     std::mutex nh_mutex;
     std::shared_ptr<LOAM> loam_ptr;
+
     ros::Subscriber sub_;
     ros::Publisher odom_pub;
-    
+    ros::Publisher cloudinW_pub;
+    ros::Publisher priormap_pub; 
+
     // Queue for storing incoming point clouds.
     std::deque<CloudXYZITPtr> cloud_queue;
     std::mutex buffer_mutex;
