@@ -19,106 +19,18 @@
 /**
  * @brief Load the prior map from a PCD file if enabled, downsample if `pmap_leaf_size` is valid, and initialize KdTree.
  * @param use_priormap If `false`, do not load the prior map.
- * @param priormap_file Path to the prior map file (.pcd)
  * @param pmap_leaf_size Voxel size for downsampling the prior map (if applicable)
  * @param priormap Variable to store the prior map (PointCloud)
  * @param kdTreeMap KdTree for querying points in the prior map
  * @return true if successfully loaded or if `use_priormap = false`, false if there is an error loading the prior map.
  */
-bool loadPriorMap(bool use_priormap, const std::string &priormap_file, double pmap_leaf_size,
-                  CloudXYZIPtr &priormap, KdFLANNPtr &kdTreeMap)
-{
-    if (!use_priormap)
-    {
-        ROS_WARN("Prior map is disabled. Skipping loading.");
-        return false;
-    }
 
-    if (priormap_file.empty())
-    {
-        ROS_WARN("No prior map file provided.");
-        return false;
-    }
-
-    // Load data from the PCD file into the point cloud
-    priormap.reset(new pcl::PointCloud<pcl::PointXYZI>());
-    if (pcl::io::loadPCDFile<pcl::PointXYZI>(priormap_file, *priormap) == -1)
-    {
-        ROS_ERROR("Could not load prior map from %s", priormap_file.c_str());
-        return false;
-    }
-
-    ROS_INFO("Loaded prior map with %zu points", priormap->size());
-
-    // Reduce data density if needed
-    if (pmap_leaf_size > 0)
-    {
-        pcl::UniformSampling<pcl::PointXYZI> downsampler;
-        downsampler.setRadiusSearch(pmap_leaf_size);
-        downsampler.setInputCloud(priormap);
-
-        CloudXYZIPtr downsampledMap(new pcl::PointCloud<pcl::PointXYZI>());
-        downsampler.filter(*downsampledMap);
-        priormap.swap(downsampledMap);
-
-        ROS_INFO("Downsampled prior map to %zu points with leaf size %.2f",
-                 priormap->size(), pmap_leaf_size);
-    }
-    else
-    {
-        ROS_WARN("Skipping downsampling because pmap_leaf_size is not set.");
-    }
-
-    // Build KdTree for fast point queries
-    kdTreeMap.reset(new pcl::KdTreeFLANN<pcl::PointXYZI>());
-    kdTreeMap->setInputCloud(priormap);
-
-    ROS_INFO("Built KdTree for prior map.");
-    return true;
-}
-
-void publishPose(ros::Publisher &odom_pub, const std::shared_ptr<LOAM> &loam_ptr, 
-                 double processTime, double initial_time)
-{
-    // Compute the current pose from the trajectory
-    SE3d currentPose = loam_ptr->GetTraj()->pose(processTime);
-
-    // Log the computed pose
-    ROS_INFO("Computed current pose:");
-    ROS_INFO("  Position: [%.3f, %.3f, %.3f]",
-             currentPose.translation().x(), 
-             currentPose.translation().y(), 
-             currentPose.translation().z());
-    ROS_INFO("  Orientation (quat): [%.3f, %.3f, %.3f, %.3f]",
-             currentPose.unit_quaternion().x(), 
-             currentPose.unit_quaternion().y(),
-             currentPose.unit_quaternion().z(), 
-             currentPose.unit_quaternion().w());
-
-    // Create and set up the odometry message
-    nav_msgs::Odometry odomMsg;
-    odomMsg.header.stamp = ros::Time(processTime + initial_time);  // Use absolute timestamp
-    odomMsg.header.frame_id = "world";
-    odomMsg.child_frame_id = "lidar_0_body";
-
-    odomMsg.pose.pose.position.x = currentPose.translation().x();
-    odomMsg.pose.pose.position.y = currentPose.translation().y();
-    odomMsg.pose.pose.position.z = currentPose.translation().z();
-
-    odomMsg.pose.pose.orientation.x = currentPose.unit_quaternion().x();
-    odomMsg.pose.pose.orientation.y = currentPose.unit_quaternion().y();
-    odomMsg.pose.pose.orientation.z = currentPose.unit_quaternion().z();
-    odomMsg.pose.pose.orientation.w = currentPose.unit_quaternion().w();
-
-    // Publish odometry
-    odom_pub.publish(odomMsg);
-}
 
 // ROS node for LOAM processing using a queue-based approach with relative time handling.
-class LOAMNode
+class LITELOAM
 {
 public:
-    LOAMNode(ros::NodeHandle &nh)
+    LITELOAM(ros::NodeHandle &nh)
     {
         nh_ptr = boost::make_shared<ros::NodeHandle>(nh);
         init(nh);
@@ -126,7 +38,7 @@ public:
 
 void init(ros::NodeHandle &nh)
 {
-ROS_INFO("Initializing LOAMNode...");
+ROS_INFO("Initializing LITELOAM...");
 
         // (1) Read parameters from the ROS Parameter Server
         bool use_priormap;
@@ -141,46 +53,23 @@ ROS_INFO("Initializing LOAMNode...");
         ss >> init_x >> init_y >> init_z >> init_qx >> init_qy >> init_qz >> init_qw;
 
         nh.param("use_priormap", use_priormap, true);  // Default to enabling prior map
-        nh.getParam("priormap_file", priormap_file);
         nh.getParam("pmap_leaf_size", pmap_leaf_size);
         nh.param("cloud_ds", cloud_downsample_radius, 0.1);  // Default downsampling to 0.1m
 
         priormap.reset(new pcl::PointCloud<pcl::PointXYZI>());
         kdTreeMap.reset(new pcl::KdTreeFLANN<pcl::PointXYZI>());
         // (2) Load prior map if enabled
-        if (use_priormap && !priormap_file.empty())
+        if (use_priormap)
         {
-            if (pcl::io::loadPCDFile<pcl::PointXYZI>(priormap_file, *priormap) == -1)
-            {
-                ROS_ERROR("Could not load prior map from %s", priormap_file.c_str());
-            }
-            else
-            {
                 ROS_INFO("Loaded prior map with %zu points", priormap->size());
-
-                // Reduce point cloud density if needed
-                if (pmap_leaf_size > 0)
-                {
-                    pcl::UniformSampling<pcl::PointXYZI> downsampler;
-                    downsampler.setRadiusSearch(pmap_leaf_size);
-                    downsampler.setInputCloud(priormap);
-
-                    CloudXYZIPtr downsampledMap(new pcl::PointCloud<pcl::PointXYZI>());
-                    downsampler.filter(*downsampledMap);
-                    priormap.swap(downsampledMap);
-
-                    ROS_INFO("Downsampled prior map to %zu points with leaf size %.2f",
-                             priormap->size(), pmap_leaf_size);
-                }
 
                 // Build KdTree
                 kdTreeMap->setInputCloud(priormap);
                 ROS_INFO("Built KdTree for prior map.");
-            }
         }
         else
         {
-            ROS_WARN("Prior map is disabled or file not provided.");
+            ROS_WARN("Prior map is disabled.");
         }
 
         // (3) Initialize system variables
@@ -203,21 +92,16 @@ ROS_INFO("Initializing LOAMNode...");
         ROS_INFO("LOAM system initialized.");
 
         // (4) Set up Subscriber (Receive data from LiDAR)
-        sub_ = nh_ptr->subscribe("/os_cloud_node/points", 1, &LOAMNode::cloudCallback, this);
+        sub_ = nh_ptr->subscribe("/os_cloud_node/points", 1, &LITELOAM::cloudCallback, this);
         ROS_INFO("Subscribed to /os_cloud_node/points");
 
         // (5) Set up Publishers
         odom_pub = nh_ptr->advertise<nav_msgs::Odometry>("/loam_odom", 10);
-        cloudinW_pub = nh_ptr->advertise<sensor_msgs::PointCloud2>("/cloudinW", 10);
-        priormap_pub = nh_ptr->advertise<sensor_msgs::PointCloud2>("/priormap", 1);
-
-        // Publish priormap
-        Util::publishCloud(priormap_pub, *priormap, ros::Time::now(), "world");
 
         // (6) Create buffer processing timer
-        processing_timer = nh_ptr->createTimer(ros::Duration(0.2), &LOAMNode::processBuffer, this);
+        processing_timer = nh_ptr->createTimer(ros::Duration(0.2), &LITELOAM::processBuffer, this);
 
-        ROS_INFO("LOAMNode initialization completed.");
+        ROS_INFO("LITELOAM initialization completed.");
 }
     
     // Callback for receiving point cloud messages.
@@ -225,12 +109,10 @@ ROS_INFO("Initializing LOAMNode...");
 void cloudCallback(const sensor_msgs::PointCloud2ConstPtr &cloud_msg)
     {
         double msg_time = cloud_msg->header.stamp.toSec();
-        // ROS_INFO("Entered cloudCallback at time: %.3f", msg_time);
         
         // If this is the first message, initialize initial_time and update trajectory start time.
         if (initial_time < 0) {
             initial_time = msg_time;
-            // ROS_INFO("Initialized initial_time: %.3f", initial_time);
             loam_ptr->GetTraj()->setStartTime(0.0);
         }
         
@@ -272,13 +154,9 @@ void cloudCallback(const sensor_msgs::PointCloud2ConstPtr &cloud_msg)
             cloudToProcess = cloud_queue.front();
             cloud_queue.pop_front();
         }
-        double processTime = (cloudToProcess->empty()) ? 0.0 : cloudToProcess->points[0].t;
-        // ROS_INFO("Processing cloud from queue, relative time: %.3f, size: %zu", processTime, cloudToProcess->size());
-        
-        // Downsample the cloud using UniformSampling.
-        // Use the overload that outputs a temporary point cloud to preserve all fields.
+        double processTime = (cloudToProcess->empty()) ? 0.0 : cloudToProcess->points[0].t;        
+
         CloudXYZITPtr downsampledCloud(new CloudXYZIT);
-        // ROS_INFO("Downsampling cloud of size: %zu", cloudToProcess->size());
         {
             pcl::UniformSampling<PointXYZIT> downsampler;
             downsampler.setRadiusSearch(cloud_downsample_radius);
@@ -288,16 +166,10 @@ void cloudCallback(const sensor_msgs::PointCloud2ConstPtr &cloud_msg)
             *downsampledCloud = tempFiltered;
         }
         // ROS_INFO("Downsampled cloud has %zu points", downsampledCloud->size());
-        if (downsampledCloud->empty()) {
-            ROS_WARN("Downsampled cloud is empty, skipping processing.");
-            return;
-        }
-        // ROS_INFO("First point timestamp in downsampled cloud (relative): %.3f", downsampledCloud->points[0].t);
-        
+
         // Ensure the trajectory is extended to cover processTime.
         while (loam_ptr->GetTraj()->getMaxTime() < processTime) {
             loam_ptr->GetTraj()->extendOneKnot(loam_ptr->GetTraj()->getKnot(loam_ptr->GetTraj()->getNumKnots()-1));
-            // ROS_INFO("Extended trajectory to cover time: %.3f", loam_ptr->GetTraj()->getMaxTime());
         }
         
         // Deskew the cloud.
@@ -327,47 +199,46 @@ void cloudCallback(const sensor_msgs::PointCloud2ConstPtr &cloud_msg)
         loam_ptr->Associate(loam_ptr->GetTraj(), kdTreeMap, priormap, downsampledCloud, deskewedCloud, cloudInW, Coef);
         ROS_INFO("Associated features: %zu", Coef.size());
 
-        // Initialize pose variables for optimization (initially using the current trajectory pose)
-        Eigen::Quaterniond current_q = loam_ptr->GetTraj()->pose(processTime).unit_quaternion();
-        Eigen::Vector3d current_t = loam_ptr->GetTraj()->pose(processTime).translation();
-
-        // Store pose parameters into an array [qw, qx, qy, qz, tx, ty, tz]
-        double pose_update[7] = { current_q.w(), current_q.x(), current_q.y(), current_q.z(),
-                                  current_t.x(), current_t.y(), current_t.z() };
-
-        ceres::Problem problem;
-
-        // Add residual blocks for each feature in Coef
-        for (const auto &coef : Coef) {
-            // Create a cost function for each residual block using AutoDiff 
-            // (Residual size = 3, pose has 7 parameters)
-            ceres::CostFunction* cost_function =
-                new ceres::AutoDiffCostFunction<LoamResidual, 3, 7>(new LoamResidual(coef));
-            problem.AddResidualBlock(cost_function, nullptr, pose_update);
-        }
-
-        // Configure solver options
-        ceres::Solver::Options options;
-        options.linear_solver_type = ceres::DENSE_QR;
-        options.minimizer_progress_to_stdout = true;
-        ceres::Solver::Summary summary;
-
-        // Solve the optimization problem
-        ceres::Solve(options, &problem, &summary);
-        ROS_INFO("Ceres optimization complete: %s", summary.BriefReport().c_str());
-
-        // After optimization, update the pose in the LOAM system.
-        // Example: Update trajectory with the optimized pose
-        Eigen::Quaterniond optimized_q(pose_update[0], pose_update[1], pose_update[2], pose_update[3]);
-        Eigen::Vector3d optimized_t(pose_update[4], pose_update[5], pose_update[6]);
-        loam_ptr->UpdatePose(optimized_q, optimized_t);
-
-        Util::publishCloud(cloudinW_pub, *cloudInW, ros::Time::now(), "world");
 
         publishPose(odom_pub, loam_ptr, processTime, initial_time);
 
     }
-    
+    void publishPose(ros::Publisher &odom_pub, const std::shared_ptr<LOAM> &loam_ptr, 
+        double processTime, double initial_time)
+    {
+        // Compute the current pose from the trajectory
+        SE3d currentPose = loam_ptr->GetTraj()->pose(processTime);
+
+        // Log the computed pose
+        ROS_INFO("Computed current pose:");
+        ROS_INFO("  Position: [%.3f, %.3f, %.3f]",
+            currentPose.translation().x(), 
+            currentPose.translation().y(), 
+            currentPose.translation().z());
+        ROS_INFO("  Orientation (quat): [%.3f, %.3f, %.3f, %.3f]",
+            currentPose.unit_quaternion().x(), 
+            currentPose.unit_quaternion().y(),
+            currentPose.unit_quaternion().z(), 
+            currentPose.unit_quaternion().w());
+
+        // Create and set up the odometry message
+        nav_msgs::Odometry odomMsg;
+        odomMsg.header.stamp = ros::Time(processTime + initial_time);  // Use absolute timestamp
+        odomMsg.header.frame_id = "world";
+        odomMsg.child_frame_id = "lidar_0_body";
+
+        odomMsg.pose.pose.position.x = currentPose.translation().x();
+        odomMsg.pose.pose.position.y = currentPose.translation().y();
+        odomMsg.pose.pose.position.z = currentPose.translation().z();
+
+        odomMsg.pose.pose.orientation.x = currentPose.unit_quaternion().x();
+        odomMsg.pose.pose.orientation.y = currentPose.unit_quaternion().y();
+        odomMsg.pose.pose.orientation.z = currentPose.unit_quaternion().z();
+        odomMsg.pose.pose.orientation.w = currentPose.unit_quaternion().w();
+
+        // Publish odometry
+        odom_pub.publish(odomMsg);
+    }
 private:
     boost::shared_ptr<ros::NodeHandle> nh_ptr;
     std::mutex nh_mutex;
@@ -375,11 +246,10 @@ private:
 
     ros::Subscriber sub_;
     ros::Publisher odom_pub;
-    ros::Publisher cloudinW_pub;
-    ros::Publisher priormap_pub; 
 
     // Queue for storing incoming point clouds.
     std::deque<CloudXYZITPtr> cloud_queue;
+
     std::mutex buffer_mutex;
     
     double cloud_downsample_radius;
@@ -398,7 +268,7 @@ int main(int argc, char** argv)
     ros::init(argc, argv, "loam_node");
     ros::NodeHandle nh("~");
     
-    LOAMNode node(nh);
+    LITELOAM node(nh);
     ros::spin();
     return 0;
 }
